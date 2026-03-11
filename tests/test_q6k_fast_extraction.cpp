@@ -39,6 +39,9 @@ void extract_ref(const uint8_t* ql, const uint8_t* qh, int base, float* qs) {
 
 // Fast extraction
 void extract_fast(const uint8_t* blk_ql, const uint8_t* blk_qh, int base, float* qs) {
+    // base must be aligned to 4 so that the 32-bit loads below stay in-bounds.
+    assert(base % 4 == 0 && "base must be a multiple of 4 for aligned 32-bit loads");
+
     const int half = base / 128;
     const int col  = (base % 128) / 32; // 0..3
     const int l    = (base % 32);       // 0..28

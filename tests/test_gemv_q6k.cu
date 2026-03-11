@@ -33,9 +33,8 @@
         }                                                                       \
     } while (0)
 
-static const char* MODEL_PATH =
-    "/home/efeaydin/Desktop/fence-inference-1/"
-    "p-e-w_Qwen3-4B-Instruct-2507-heretic-Q6_K_L.gguf";
+// Model path — can be overridden via argv[1] at runtime
+static const char* MODEL_PATH = nullptr;
 
 // ---------- Helper: set a 6-bit quant in a block ----------
 static void set_q6(block_q6_K& blk, int i, int val) {
@@ -224,6 +223,12 @@ static void test_synthetic_multi_block() {
 static void test_real_tensor() {
     printf("\n--- Test: Real GGUF tensor (blk.0.attn_k.weight 1024x2560) ---\n");
 
+    if (!MODEL_PATH) {
+        tests_total++;
+        printf("  [SKIP] No GGUF file provided (pass path as argv[1])\n");
+        return;
+    }
+
     GGUFFile gguf;
     if (!gguf.open(MODEL_PATH)) {
         tests_total++;
@@ -319,8 +324,13 @@ static void test_real_tensor() {
 }
 
 // ---------- Main ----------
-int main() {
+int main(int argc, char** argv) {
     printf("=== GEMV Q6_K Kernel Tests ===\n");
+
+    // Optional model path for the real-tensor test (Test 3)
+    if (argc >= 2) {
+        MODEL_PATH = argv[1];
+    }
 
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
