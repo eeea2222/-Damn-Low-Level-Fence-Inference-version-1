@@ -31,9 +31,12 @@ void print_stats(const char* name, float* d_buf, int n) {
     printf("\n");
 }
 
-int main() {
-    const char* model_path = "/home/efeaydin/Desktop/fence-inference-1/"
-        "p-e-w_Qwen3-4B-Instruct-2507-heretic-Q6_K_L.gguf";
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <model.gguf>\n", argv[0]);
+        return 1;
+    }
+    const char* model_path = argv[1];
 
     Qwen3Model model;
     model.config.max_ctx = 64;

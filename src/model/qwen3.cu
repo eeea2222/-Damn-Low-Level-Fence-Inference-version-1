@@ -123,15 +123,37 @@ bool Qwen3Model::load(const std::string& gguf_path) {
         arch = gguf_.get_string("general.architecture");
     } catch (...) {}
 
-    // Config from metadata
+    // Config from metadata (rope.freq_base and head_dim are optional in some models)
     config.n_layers       = gguf_.get_u32(arch + ".block_count");
     config.embed_dim      = gguf_.get_u32(arch + ".embedding_length");
     config.ff_dim         = gguf_.get_u32(arch + ".feed_forward_length");
     config.n_heads        = gguf_.get_u32(arch + ".attention.head_count");
     config.n_kv_heads     = gguf_.get_u32(arch + ".attention.head_count_kv");
-    config.head_dim       = gguf_.get_u32(arch + ".attention.key_length");
-    config.rope_freq_base = gguf_.get_f32(arch + ".rope.freq_base");
-    config.rms_eps        = gguf_.get_f32(arch + ".attention.layer_norm_rms_epsilon");
+
+    // head_dim is optional — compute from embed_dim / n_heads if not present
+    try {
+        config.head_dim = gguf_.get_u32(arch + ".attention.key_length");
+    } catch (...) {
+        config.head_dim = config.embed_dim / config.n_heads;
+        printf("Config: head_dim not in metadata, inferred %d\n", config.head_dim);
+    }
+
+    // rope.freq_base is optional — default 10000 covers LLaMA 2, older models
+    try {
+        config.rope_freq_base = gguf_.get_f32(arch + ".rope.freq_base");
+    } catch (...) {
+        config.rope_freq_base = 10000.0f;
+        printf("Config: rope.freq_base not in metadata, using default %.0f\n",
+               config.rope_freq_base);
+    }
+
+    // rms_eps — optional, default 1e-5 covers most models
+    try {
+        config.rms_eps = gguf_.get_f32(arch + ".attention.layer_norm_rms_epsilon");
+    } catch (...) {
+        config.rms_eps = 1e-5f;
+        printf("Config: rms_epsilon not in metadata, using default %.0e\n", config.rms_eps);
+    }
 
     auto* embd_ti = gguf_.find_tensor("token_embd.weight");
     if (!embd_ti) { fprintf(stderr, "Missing token_embd.weight\n"); return false; }
@@ -140,8 +162,16 @@ bool Qwen3Model::load(const std::string& gguf_path) {
     printf("Config: layers=%d embed=%d ff=%d heads=%d/%d head_dim=%d vocab=%d\n",
            config.n_layers, config.embed_dim, config.ff_dim,
            config.n_heads, config.n_kv_heads, config.head_dim, config.vocab_size);
+
+    // Compute VRAM estimate from actual model dimensions
+    double weight_bytes = (double)config.n_layers *
+        (config.q_dim() * config.embed_dim * 6.5625 / 8.0 +   // Q6_K attn+ffn (≈6.5625 bpw)
+         config.kv_dim() * config.embed_dim * 2.0 * 6.5625 / 8.0 +
+         config.embed_dim * config.ff_dim * 3.0 * 6.5625 / 8.0);
+    double kv_bytes = (double)config.n_layers * 2 * config.max_ctx *
+                      config.kv_dim() * sizeof(uint16_t);
     printf("VRAM estimate: ~%.1f GB weights + %.0f MB KV cache\n",
-           3.2, (double)config.n_layers * 2 * config.max_ctx * config.kv_dim() * 2 / 1e6);
+           weight_bytes / 1e9, kv_bytes / 1e6);
 
     // Copy weights to GPU
     printf("Copying weights to GPU...\n");
@@ -258,10 +288,13 @@ void Qwen3Model::forward_attention(int l, int pos, bool dl) {
     CUDA_CHECK(cudaDeviceSynchronize());
     if (dl) { dbg("Q proj", s.q, c.q_dim()); dbg("K proj", s.k, c.kv_dim()); dbg("V proj", s.v, c.kv_dim()); }
 
-    rms_norm_per_head(s.q, (float*)lw.attn_q_norm, c.n_heads, c.head_dim, c.rms_eps);
-    rms_norm_per_head(s.k, (float*)lw.attn_k_norm, c.n_kv_heads, c.head_dim, c.rms_eps);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    if (dl) { dbg("Q qk-norm", s.q, c.q_dim()); dbg("K qk-norm", s.k, c.kv_dim()); }
+    // Only apply QK-norm when weights are present (optional in LLaMA-2, Mistral, etc.)
+    if (lw.attn_q_norm && lw.attn_k_norm) {
+        rms_norm_per_head(s.q, (float*)lw.attn_q_norm, c.n_heads, c.head_dim, c.rms_eps);
+        rms_norm_per_head(s.k, (float*)lw.attn_k_norm, c.n_kv_heads, c.head_dim, c.rms_eps);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        if (dl) { dbg("Q qk-norm", s.q, c.q_dim()); dbg("K qk-norm", s.k, c.kv_dim()); }
+    }
 
     apply_rope(s.q, s.k, c.head_dim, c.n_heads, c.n_kv_heads, pos, c.rope_freq_base);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -367,8 +400,15 @@ int Qwen3Model::sample_nucleus(float* logits_ptr, const std::vector<int>& histor
                 if (p > 1e-6f) entropy -= p * logf(p);
             }
         }
-        // Scale temperature based on confusion: High entropy = higher temp, Low entropy = lower temp.
-        float scale = std::clamp(entropy / 2.0f, 0.5f, 2.0f);
+        // Dynamic temperature: scale by normalised entropy.
+        // Maximum entropy over V tokens is log(V) ≈ 12 nats for a 151k vocab, but
+        // useful entropy rarely exceeds ~4 nats after min-p filtering.  Dividing by
+        // 2.0 maps the typical [0, 4] range to [0, 2], then clamping to [0.5, 2.0]
+        // keeps temperature within half–double of the base value.
+        static constexpr float ENTROPY_NORM   = 2.0f;  // divisor to normalise entropy
+        static constexpr float TEMP_SCALE_MIN = 0.5f;  // never less than half base-temp
+        static constexpr float TEMP_SCALE_MAX = 2.0f;  // never more than double base-temp
+        float scale = std::clamp(entropy / ENTROPY_NORM, TEMP_SCALE_MIN, TEMP_SCALE_MAX);
         current_temp *= scale;
     }
     
@@ -429,7 +469,7 @@ std::vector<int> Qwen3Model::generate(
     std::vector<int> output;
     output.reserve(prompt_tokens.size() + max_new_tokens);
 
-    const int eos_id = 151645;  // <|im_end|>
+    const int eos_id = tokenizer ? tokenizer->eos_id() : Tokenizer::EOS;
 
     auto t_start = std::chrono::steady_clock::now();
     int prompt_len = (int)prompt_tokens.size();

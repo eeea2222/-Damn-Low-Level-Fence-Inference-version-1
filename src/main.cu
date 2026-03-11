@@ -1,5 +1,5 @@
 // =============================================================================
-// main.cu — Fence Inference Engine: Interactive Qwen3 Chat
+// main.cu — Fence Inference Engine: Multi-architecture interactive chat
 // =============================================================================
 
 #include <cstdio>
@@ -14,89 +14,115 @@
 
 extern bool g_debug;  // defined in qwen3.cu
 
-static const char* MODEL_PATH =
-    "/home/efeaydin/Desktop/fence-inference-1/"
-    "p-e-w_Qwen3-4B-Instruct-2507-heretic-Q6_K_L.gguf";
-
 static void print_usage(const char* prog) {
-    printf("Usage: %s [options]\n", prog);
-    printf("  --model PATH    Model GGUF file (default: built-in path)\n");
-    printf("  --prompt TEXT    Single prompt (non-interactive mode)\n");
-    printf("  --max-tokens N   Max new tokens to generate (default: 512)\n");
-    printf("  --max-ctx N      Max context length (default: 4096)\n");
-    printf("  --system TEXT    System prompt\n");
+    printf("Usage: %s --model PATH [options]\n\n", prog);
+    printf("Required:\n");
+    printf("  --model PATH       GGUF model file\n\n");
+    printf("Options:\n");
+    printf("  --prompt TEXT      Single prompt (non-interactive mode)\n");
+    printf("  --system TEXT      System prompt (default: 'You are a helpful assistant.')\n");
+    printf("  --max-tokens N     Max new tokens to generate (default: 512)\n");
+    printf("  --max-ctx N        Max context length in tokens (default: 4096)\n");
+    printf("  --temp F           Sampling temperature (default: 0.7)\n");
+    printf("  --top-p F          Top-p nucleus cutoff (default: 0.8)\n");
+    printf("  --top-k N          Top-k candidates (default: 50)\n");
+    printf("  --rep-penalty F    Repetition penalty (default: 1.15)\n");
+    printf("  --debug            Print per-layer activation statistics\n");
+    printf("  --help             Show this help\n\n");
+    printf("Supported architectures: Qwen2, Qwen3, LLaMA-3, LLaMA-2, Mistral, Mixtral\n");
 }
 
 int main(int argc, char** argv) {
-    printf("╔═══════════════════════════════════════════════╗\n");
-    printf("║   Fence Inference Engine v0.1                 ║\n");
-    printf("║   Qwen3-4B Q6_K_L — RTX 4060 CUDA            ║\n");
-    printf("╚═══════════════════════════════════════════════╝\n\n");
+    printf("╔═══════════════════════════════════════════════════╗\n");
+    printf("║   Fence Inference Engine v0.2                     ║\n");
+    printf("║   Multi-architecture GGUF — CUDA inference        ║\n");
+    printf("╚═══════════════════════════════════════════════════╝\n\n");
 
-    std::string model_path = MODEL_PATH;
+    std::string model_path;
     std::string single_prompt;
     std::string system_prompt = "You are a helpful assistant.";
-    int max_tokens = 512;
-    int max_ctx = 4096;
-    bool debug = false;
+    int   max_tokens = 512;
+    int   max_ctx    = 4096;
+    bool  debug      = false;
 
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
-            model_path = argv[++i];
-        } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
-            single_prompt = argv[++i];
-        } else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
-            max_tokens = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--max-ctx") == 0 && i + 1 < argc) {
-            max_ctx = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
-            system_prompt = argv[++i];
-        } else if (strcmp(argv[i], "--debug") == 0) {
-            debug = true;
-        } else if (strcmp(argv[i], "--help") == 0) {
-            print_usage(argv[0]); return 0;
-        }
+        if      (strcmp(argv[i], "--model")      == 0 && i + 1 < argc) model_path    = argv[++i];
+        else if (strcmp(argv[i], "--prompt")     == 0 && i + 1 < argc) single_prompt = argv[++i];
+        else if (strcmp(argv[i], "--system")     == 0 && i + 1 < argc) system_prompt = argv[++i];
+        else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) max_tokens    = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--max-ctx")    == 0 && i + 1 < argc) max_ctx       = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--temp")       == 0 && i + 1 < argc) { /* handled below */ ++i; }
+        else if (strcmp(argv[i], "--top-p")      == 0 && i + 1 < argc) { ++i; }
+        else if (strcmp(argv[i], "--top-k")      == 0 && i + 1 < argc) { ++i; }
+        else if (strcmp(argv[i], "--rep-penalty")== 0 && i + 1 < argc) { ++i; }
+        else if (strcmp(argv[i], "--debug")      == 0) debug = true;
+        else if (strcmp(argv[i], "--help")       == 0) { print_usage(argv[0]); return 0; }
+        else { fprintf(stderr, "Unknown option: %s\n", argv[i]); print_usage(argv[0]); return 1; }
+    }
+
+    if (model_path.empty()) {
+        fprintf(stderr, "Error: --model PATH is required.\n\n");
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    // Re-parse sampling flags now that we know they're valid
+    for (int i = 1; i < argc; ++i) {
+        if      (strcmp(argv[i], "--temp")        == 0 && i + 1 < argc) { /* loaded after model */ ++i; }
+        else if (strcmp(argv[i], "--top-p")       == 0 && i + 1 < argc) { ++i; }
+        else if (strcmp(argv[i], "--top-k")       == 0 && i + 1 < argc) { ++i; }
+        else if (strcmp(argv[i], "--rep-penalty")== 0 && i + 1 < argc) { ++i; }
     }
 
     g_debug = debug;
 
-    // Load tokenizer
+    // ---- Load tokenizer ----
     Tokenizer tokenizer;
     if (!tokenizer.load_from_gguf(model_path)) return 1;
 
-    // Load model
+    printf("Chat format : %s\n\n", chat_format_name(tokenizer.chat_format()));
+
+    // ---- Load model ----
     Qwen3Model model;
     model.config.max_ctx = max_ctx;
+
+    // Apply sampling parameters from CLI
+    for (int i = 1; i < argc; ++i) {
+        if      (strcmp(argv[i], "--temp")        == 0 && i + 1 < argc)
+            model.config.temperature = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--top-p")       == 0 && i + 1 < argc)
+            model.config.top_p = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--top-k")       == 0 && i + 1 < argc)
+            model.config.top_k = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--rep-penalty") == 0 && i + 1 < argc)
+            model.config.repetition_penalty = (float)atof(argv[++i]);
+        else if (argv[i][0] == '-' && argv[i][1] == '-' && i + 1 < argc) ++i;
+    }
+
     if (!model.load(model_path)) return 1;
 
-    // Single prompt mode
+    // ---- Single-prompt mode ----
     if (!single_prompt.empty()) {
         auto tokens = tokenizer.format_chat(system_prompt, single_prompt);
         printf("Prompt tokens: %zu\n", tokens.size());
         printf("Assistant: ");
         fflush(stdout);
-
-        auto output = model.generate(tokens, max_tokens, true, &tokenizer);
+        model.generate(tokens, max_tokens, true, &tokenizer);
         printf("\n");
         model.unload();
         return 0;
     }
 
-    // Interactive chat loop
+    // ---- Interactive chat loop ----
     printf("System: %s\n", system_prompt.c_str());
     printf("Type your message (empty line to quit).\n\n");
 
-    std::vector<int> history_tokens;
-    
-    // Convert system prompt into ChatML tokens
-    if (!system_prompt.empty()) {
-        history_tokens.push_back(Tokenizer::IM_START);
-        auto sys_toks = tokenizer.encode("system\n" + system_prompt);
-        history_tokens.insert(history_tokens.end(), sys_toks.begin(), sys_toks.end());
-        history_tokens.push_back(Tokenizer::IM_END);
-        auto nl_toks = tokenizer.encode("\n");
-        history_tokens.insert(history_tokens.end(), nl_toks.begin(), nl_toks.end());
-    }
+    std::vector<int> history;
+
+    // Initialise context with sequence-start token(s) + system prompt
+    tokenizer.begin_sequence(history);
+    if (!system_prompt.empty())
+        tokenizer.append_system_turn(history, system_prompt);
 
     while (true) {
         printf("You: ");
@@ -105,35 +131,33 @@ int main(int argc, char** argv) {
         std::string line;
         if (!std::getline(std::cin, line) || line.empty()) break;
 
-        // Append user turn to history
-        history_tokens.push_back(Tokenizer::IM_START);
-        auto usr_toks = tokenizer.encode("user\n" + line);
-        history_tokens.insert(history_tokens.end(), usr_toks.begin(), usr_toks.end());
-        history_tokens.push_back(Tokenizer::IM_END);
-        auto nl_toks = tokenizer.encode("\n");
-        history_tokens.insert(history_tokens.end(), nl_toks.begin(), nl_toks.end());
+        // Truncate context if we're approaching the limit (keep at least 256 tokens free)
+        if ((int)history.size() > max_ctx - 256) {
+            fprintf(stderr, "\n[Context limit approaching — clearing history]\n");
+            history.clear();
+            tokenizer.begin_sequence(history);
+            if (!system_prompt.empty())
+                tokenizer.append_system_turn(history, system_prompt);
+        }
 
-        // Append assistant header
-        history_tokens.push_back(Tokenizer::IM_START);
-        auto asst_toks = tokenizer.encode("assistant\n");
-        history_tokens.insert(history_tokens.end(), asst_toks.begin(), asst_toks.end());
+        tokenizer.append_user_turn(history, line);
+        tokenizer.append_assistant_header(history);
 
-        printf("  [%zu prompt tokens in active context]\n", history_tokens.size());
+        printf("  [%zu tokens in context]\n", history.size());
         printf("Assistant: ");
         fflush(stdout);
 
-        // Generate assistant response
-        auto output = model.generate(history_tokens, max_tokens, true, &tokenizer);
+        // Generate: returns history + new tokens (stops before turn-end marker)
+        auto output = model.generate(history, max_tokens, true, &tokenizer);
         printf("\n\n");
 
-        // `generate` returns the combined sequence of history + new tokens.
-        // It breaks *before* appending IM_END, so we append the cutoff manually.
-        history_tokens = output;
-        history_tokens.push_back(Tokenizer::IM_END);
-        history_tokens.insert(history_tokens.end(), nl_toks.begin(), nl_toks.end());
+        // Commit the generated response into history and close the turn
+        history = std::move(output);
+        tokenizer.append_turn_end(history);
     }
 
     model.unload();
     printf("Goodbye!\n");
     return 0;
 }
+

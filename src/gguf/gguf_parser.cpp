@@ -215,7 +215,15 @@ bool GGUFFile::parse_metadata(const uint8_t*& cursor, const uint8_t* end) {
         // Check for alignment override
         if (kv.key == "general.alignment" && stored) {
             if (kv.type == GGUFValueType::UINT32) {
-                alignment_ = std::get<uint32_t>(kv.value);
+                uint32_t a = std::get<uint32_t>(kv.value);
+                if (a == 0) {
+                    // Zero alignment is invalid and would cause modulo-by-zero below.
+                    // Warn and keep the current safe default (32).
+                    fprintf(stderr, "GGUF: general.alignment is 0, ignoring (keeping default %u)\n",
+                            alignment_);
+                } else {
+                    alignment_ = a;
+                }
             }
         }
 

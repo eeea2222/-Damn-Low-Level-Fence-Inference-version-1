@@ -1,6 +1,14 @@
 # =============================================================================
 # Makefile — Fence Inference Engine
 # Target: NVIDIA RTX 4060 (Ada Lovelace, SM 8.9)
+#
+# Usage:
+#   make fence                      build the main binary
+#   make test_q6k_dot               run the Q6_K dot-product kernel test
+#   make test_gguf_parser MODEL=... run the GGUF parser test against a model
+#   make test_gemv_q6k MODEL=...    run the GEMV Q6_K kernel test
+#   make debug_forward MODEL=...    build the layer-stats debug tool
+#   make clean                      remove build artefacts
 # =============================================================================
 
 NVCC        := nvcc
@@ -31,7 +39,8 @@ ifdef DEBUG
     CXX_FLAGS  += -g -DDEBUG
 endif
 
-.PHONY: all clean test_q6k_dot test_gguf_parser test_gemv_q6k test fence
+.PHONY: all clean fence \
+        test_q6k_dot test_gguf_parser test_gemv_q6k test debug_forward
 
 all: fence
 
@@ -42,12 +51,14 @@ $(BUILD_DIR):
 $(BUILD_DIR)/gguf_parser.o: $(GGUF_DIR)/gguf_parser.cpp $(GGUF_DIR)/gguf_parser.h | $(BUILD_DIR)
 	$(CXX) $(CXX_FLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/tokenizer.o: $(TOK_DIR)/tokenizer.cpp $(TOK_DIR)/tokenizer.h | $(BUILD_DIR)
+$(BUILD_DIR)/tokenizer.o: $(TOK_DIR)/tokenizer.cpp $(TOK_DIR)/tokenizer.h \
+                          $(MODEL_DIR)/chat_template.h | $(BUILD_DIR)
 	$(CXX) $(CXX_FLAGS) -c -o $@ $<
 
 # ---- Main inference engine ----
 FENCE_DEPS := $(SRC_DIR)/main.cu \
               $(MODEL_DIR)/qwen3.h $(MODEL_DIR)/qwen3.cu \
+              $(MODEL_DIR)/chat_template.h \
               $(KERNEL_DIR)/q6k_types.h $(KERNEL_DIR)/q6k_dot.cuh $(KERNEL_DIR)/gemv_q6k.cuh \
               $(KERNEL_DIR)/q8_0_types.h $(KERNEL_DIR)/gemv_q8_0.cuh \
               $(KERNEL_DIR)/ops.cuh \
@@ -55,6 +66,7 @@ FENCE_DEPS := $(SRC_DIR)/main.cu \
 
 fence: $(BUILD_DIR)/fence
 	@echo "Build complete: $(BUILD_DIR)/fence"
+	@echo "Run: $(BUILD_DIR)/fence --model path/to/model.gguf"
 
 $(BUILD_DIR)/fence: $(FENCE_DEPS) $(BUILD_DIR)/gguf_parser.o $(BUILD_DIR)/tokenizer.o | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $(SRC_DIR)/main.cu $(MODEL_DIR)/qwen3.cu \
@@ -64,22 +76,43 @@ $(BUILD_DIR)/fence: $(FENCE_DEPS) $(BUILD_DIR)/gguf_parser.o $(BUILD_DIR)/tokeni
 test_q6k_dot: $(BUILD_DIR)/test_q6k_dot
 	@./$(BUILD_DIR)/test_q6k_dot
 
-$(BUILD_DIR)/test_q6k_dot: $(TEST_DIR)/test_q6k_dot.cu $(KERNEL_DIR)/q6k_dot.cuh $(KERNEL_DIR)/q6k_types.h | $(BUILD_DIR)
+$(BUILD_DIR)/test_q6k_dot: $(TEST_DIR)/test_q6k_dot.cu \
+                            $(KERNEL_DIR)/q6k_dot.cuh $(KERNEL_DIR)/q6k_types.h | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $<
 
 test_gguf_parser: $(BUILD_DIR)/test_gguf_parser
-	@./$(BUILD_DIR)/test_gguf_parser
+ifndef MODEL
+	$(error MODEL is not set. Use: make test_gguf_parser MODEL=path/to/model.gguf)
+endif
+	@./$(BUILD_DIR)/test_gguf_parser $(MODEL)
 
-$(BUILD_DIR)/test_gguf_parser: $(TEST_DIR)/test_gguf_parser.cpp $(BUILD_DIR)/gguf_parser.o | $(BUILD_DIR)
+$(BUILD_DIR)/test_gguf_parser: $(TEST_DIR)/test_gguf_parser.cpp \
+                                $(BUILD_DIR)/gguf_parser.o | $(BUILD_DIR)
 	$(CXX) $(CXX_FLAGS) -o $@ $< $(BUILD_DIR)/gguf_parser.o
 
 test_gemv_q6k: $(BUILD_DIR)/test_gemv_q6k
-	@./$(BUILD_DIR)/test_gemv_q6k
+ifndef MODEL
+	$(error MODEL is not set. Use: make test_gemv_q6k MODEL=path/to/model.gguf)
+endif
+	@./$(BUILD_DIR)/test_gemv_q6k $(MODEL)
 
-$(BUILD_DIR)/test_gemv_q6k: $(TEST_DIR)/test_gemv_q6k.cu $(KERNEL_DIR)/gemv_q6k.cuh $(KERNEL_DIR)/q6k_dot.cuh $(KERNEL_DIR)/q6k_types.h $(BUILD_DIR)/gguf_parser.o | $(BUILD_DIR)
+$(BUILD_DIR)/test_gemv_q6k: $(TEST_DIR)/test_gemv_q6k.cu \
+                             $(KERNEL_DIR)/gemv_q6k.cuh $(KERNEL_DIR)/q6k_dot.cuh \
+                             $(KERNEL_DIR)/q6k_types.h $(BUILD_DIR)/gguf_parser.o | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $< $(BUILD_DIR)/gguf_parser.o
 
-test: test_q6k_dot test_gguf_parser test_gemv_q6k
+# test_q6k_dot does not need a model file
+test: test_q6k_dot
+
+# ---- Debug forward-pass tool ----
+debug_forward: $(BUILD_DIR)/debug_forward
+	@echo "Run: $(BUILD_DIR)/debug_forward path/to/model.gguf"
+
+$(BUILD_DIR)/debug_forward: $(TEST_DIR)/debug_forward.cu \
+                             $(FENCE_DEPS) \
+                             $(BUILD_DIR)/gguf_parser.o $(BUILD_DIR)/tokenizer.o | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $(TEST_DIR)/debug_forward.cu $(MODEL_DIR)/qwen3.cu \
+	    $(BUILD_DIR)/gguf_parser.o $(BUILD_DIR)/tokenizer.o
 
 # ---- Clean ----
 clean:

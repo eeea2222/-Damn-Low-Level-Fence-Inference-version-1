@@ -17,10 +17,6 @@
 #include <cmath>
 #include "../src/gguf/gguf_parser.h"
 
-static const char* MODEL_PATH =
-    "/home/efeaydin/Desktop/fence-inference-1/"
-    "p-e-w_Qwen3-4B-Instruct-2507-heretic-Q6_K_L.gguf";
-
 static int tests_passed = 0;
 static int tests_total  = 0;
 
@@ -48,8 +44,14 @@ static int tests_total  = 0;
         }                                                       \
     } while (0)
 
-int main() {
+int main(int argc, char** argv) {
     printf("=== GGUF Parser Tests ===\n\n");
+
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <model.gguf>\n", argv[0]);
+        return 1;
+    }
+    const char* MODEL_PATH = argv[1];
 
     GGUFFile gguf;
 
