@@ -37,20 +37,40 @@
 
 // ---------- CPU golden reference ----------
 // Dequantize + accumulate in FP64 for maximum precision.
+// Uses the correct swizzled Q6_K layout matching llama.cpp / GGML.
 static double cpu_q6k_dot(const block_q6_K& blk, const __half* x_host) {
     const double d = static_cast<double>(__half2float(blk.d));
     double sum = 0.0;
 
     for (int i = 0; i < QK_K; ++i) {
-        // Lower 4 bits
-        int byte_lo  = i / 2;
-        int shift_lo = (i % 2) * 4;
-        int lo4 = (blk.ql[byte_lo] >> shift_lo) & 0xF;
+        // Swizzled Q6_K layout (matches q6k_dot.cuh reference implementation)
+        const int half = i / 128;
+        const int rem  = i % 128;
+        const int col  = rem / 32;
+        const int l    = rem % 32;
 
-        // Upper 2 bits
-        int byte_hi  = i / 4;
-        int shift_hi = (i % 4) * 2;
-        int hi2 = (blk.qh[byte_hi] >> shift_hi) & 0x3;
+        int ql_idx   = 64 * half;
+        int qh_idx   = 32 * half + l;
+        int ql_shift = 0;
+        int qh_shift = 0;
+
+        if (col == 0) {
+            ql_idx += l;
+        } else if (col == 1) {
+            ql_idx += l + 32;
+            qh_shift = 2;
+        } else if (col == 2) {
+            ql_idx += l;
+            ql_shift = 4;
+            qh_shift = 4;
+        } else if (col == 3) {
+            ql_idx += l + 32;
+            ql_shift = 4;
+            qh_shift = 6;
+        }
+
+        int lo4 = (blk.ql[ql_idx] >> ql_shift) & 0xF;
+        int hi2 = (blk.qh[qh_idx] >> qh_shift) & 0x3;
 
         int q6 = lo4 | (hi2 << 4);       // [0, 63]
         int q_signed = q6 - 32;           // [-32, 31]
@@ -66,22 +86,45 @@ static double cpu_q6k_dot(const block_q6_K& blk, const __half* x_host) {
 }
 
 // ---------- Helper: pack a 6-bit quant into the block ----------
+// Uses the correct swizzled Q6_K layout matching llama.cpp / GGML.
 static void set_q6(block_q6_K& blk, int i, int val) {
     assert(val >= 0 && val <= 63);
     int lo4 = val & 0xF;
     int hi2 = (val >> 4) & 0x3;
 
+    // Swizzled Q6_K layout (matches q6k_dot.cuh reference implementation)
+    const int half = i / 128;
+    const int rem  = i % 128;
+    const int col  = rem / 32;
+    const int l    = rem % 32;
+
+    int ql_idx   = 64 * half;
+    int qh_idx   = 32 * half + l;
+    int ql_shift = 0;
+    int qh_shift = 0;
+
+    if (col == 0) {
+        ql_idx += l;
+    } else if (col == 1) {
+        ql_idx += l + 32;
+        qh_shift = 2;
+    } else if (col == 2) {
+        ql_idx += l;
+        ql_shift = 4;
+        qh_shift = 4;
+    } else if (col == 3) {
+        ql_idx += l + 32;
+        ql_shift = 4;
+        qh_shift = 6;
+    }
+
     // Set lower nibble
-    int byte_lo = i / 2;
-    int shift_lo = (i % 2) * 4;
-    blk.ql[byte_lo] &= ~(0xF << shift_lo);
-    blk.ql[byte_lo] |= (lo4 << shift_lo);
+    blk.ql[ql_idx] &= ~(0xF << ql_shift);
+    blk.ql[ql_idx] |= (lo4 << ql_shift);
 
     // Set upper crumb
-    int byte_hi = i / 4;
-    int shift_hi = (i % 4) * 2;
-    blk.qh[byte_hi] &= ~(0x3 << shift_hi);
-    blk.qh[byte_hi] |= (hi2 << shift_hi);
+    blk.qh[qh_idx] &= ~(0x3 << qh_shift);
+    blk.qh[qh_idx] |= (hi2 << qh_shift);
 }
 
 // ---------- GPU test kernels ----------
